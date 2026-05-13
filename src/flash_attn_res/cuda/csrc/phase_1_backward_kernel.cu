@@ -21,7 +21,15 @@ __device__ __forceinline__ float load_scalar(const __nv_bfloat16* ptr) {
     return __bfloat162float(*ptr);
 }
 
-template <typename GradOutT>
+__device__ __forceinline__ void store_scalar(float* ptr, float value) {
+    *ptr = value;
+}
+
+__device__ __forceinline__ void store_scalar(__nv_bfloat16* ptr, float value) {
+    *ptr = __float2bfloat16(value);
+}
+
+template <typename GradOutT, typename GradBlockT>
 __global__ void phase_1_backward_kernel(
     const __nv_bfloat16* __restrict__ block_representations,
     const __nv_bfloat16* __restrict__ pseudo_queries,
@@ -30,7 +38,7 @@ __global__ void phase_1_backward_kernel(
     const float* __restrict__ attention_logits,
     const GradOutT* __restrict__ grad_softmax_outputs,
     const float* __restrict__ grad_lses,
-    float* __restrict__ grad_block_representations,
+    GradBlockT* __restrict__ grad_block_representations,
     float* __restrict__ grad_pseudo_queries,
     int num_source_blocks,
     int num_batch_seq,
@@ -229,10 +237,13 @@ __global__ void phase_1_backward_kernel(
                     hidden_idx;
 
                 if (accumulate_grad_blocks) {
-                    grad_source += grad_block_representations[grad_block_offset];
+                    grad_source += load_scalar(
+                        grad_block_representations + grad_block_offset);
                 }
 
-                grad_block_representations[grad_block_offset] = grad_source;
+                store_scalar(
+                    grad_block_representations + grad_block_offset,
+                    grad_source);
             }
         }
 
@@ -257,7 +268,7 @@ __global__ void phase_1_backward_kernel(
     }
 }
 
-template <typename GradOutT>
+template <typename GradOutT, typename GradBlockT>
 void launch_phase_1_backward(
     const __nv_bfloat16* block_representations,
     const __nv_bfloat16* pseudo_queries,
@@ -266,7 +277,7 @@ void launch_phase_1_backward(
     const float* attention_logits,
     const GradOutT* grad_softmax_outputs,
     const float* grad_lses,
-    float* grad_block_representations,
+    GradBlockT* grad_block_representations,
     float* grad_pseudo_queries,
     int num_source_blocks,
     int num_batch_seq,
@@ -283,7 +294,8 @@ void launch_phase_1_backward(
          kBlockBt * kBlockX) *
         sizeof(float);
 
-    phase_1_backward_kernel<<<grid, block, shared_bytes, stream>>>(
+    phase_1_backward_kernel<GradOutT, GradBlockT>
+        <<<grid, block, shared_bytes, stream>>>(
         block_representations,
         pseudo_queries,
         lses,
@@ -359,8 +371,9 @@ void phase_1_backward_cuda(
     TORCH_CHECK(
         grad_lses.scalar_type() == at::kFloat, "grad_lses must be fp32");
     TORCH_CHECK(
-        grad_block_representations.scalar_type() == at::kFloat,
-        "grad_block_representations must be fp32");
+        grad_block_representations.scalar_type() == at::kFloat ||
+            grad_block_representations.scalar_type() == at::kBFloat16,
+        "grad_block_representations must be fp32 or bf16");
     TORCH_CHECK(
         grad_pseudo_queries.scalar_type() == at::kFloat,
         "grad_pseudo_queries must be fp32");
@@ -395,44 +408,54 @@ void phase_1_backward_cuda(
     const auto* query_ptr = reinterpret_cast<const __nv_bfloat16*>(
         pseudo_queries.data_ptr<at::BFloat16>());
 
+    auto launch_with_grad_block = [&](auto grad_output_ptr) {
+        if (grad_block_representations.scalar_type() == at::kBFloat16) {
+            auto* grad_block_ptr = reinterpret_cast<__nv_bfloat16*>(
+                grad_block_representations.data_ptr<at::BFloat16>());
+            launch_phase_1_backward(
+                block_ptr,
+                query_ptr,
+                lses.data_ptr<float>(),
+                inverse_rms_norms.data_ptr<float>(),
+                attention_logits.data_ptr<float>(),
+                grad_output_ptr,
+                grad_lses.data_ptr<float>(),
+                grad_block_ptr,
+                grad_pseudo_queries.data_ptr<float>(),
+                num_source_blocks,
+                num_batch_seq,
+                hidden_dim,
+                num_queries,
+                has_grad_lses,
+                accumulate_grad_blocks,
+                stream);
+        } else {
+            launch_phase_1_backward(
+                block_ptr,
+                query_ptr,
+                lses.data_ptr<float>(),
+                inverse_rms_norms.data_ptr<float>(),
+                attention_logits.data_ptr<float>(),
+                grad_output_ptr,
+                grad_lses.data_ptr<float>(),
+                grad_block_representations.data_ptr<float>(),
+                grad_pseudo_queries.data_ptr<float>(),
+                num_source_blocks,
+                num_batch_seq,
+                hidden_dim,
+                num_queries,
+                has_grad_lses,
+                accumulate_grad_blocks,
+                stream);
+        }
+    };
+
     if (grad_softmax_outputs.scalar_type() == at::kBFloat16) {
         const auto* grad_output_ptr = reinterpret_cast<const __nv_bfloat16*>(
             grad_softmax_outputs.data_ptr<at::BFloat16>());
-        launch_phase_1_backward(
-            block_ptr,
-            query_ptr,
-            lses.data_ptr<float>(),
-            inverse_rms_norms.data_ptr<float>(),
-            attention_logits.data_ptr<float>(),
-            grad_output_ptr,
-            grad_lses.data_ptr<float>(),
-            grad_block_representations.data_ptr<float>(),
-            grad_pseudo_queries.data_ptr<float>(),
-            num_source_blocks,
-            num_batch_seq,
-            hidden_dim,
-            num_queries,
-            has_grad_lses,
-            accumulate_grad_blocks,
-            stream);
+        launch_with_grad_block(grad_output_ptr);
     } else {
-        launch_phase_1_backward(
-            block_ptr,
-            query_ptr,
-            lses.data_ptr<float>(),
-            inverse_rms_norms.data_ptr<float>(),
-            attention_logits.data_ptr<float>(),
-            grad_softmax_outputs.data_ptr<float>(),
-            grad_lses.data_ptr<float>(),
-            grad_block_representations.data_ptr<float>(),
-            grad_pseudo_queries.data_ptr<float>(),
-            num_source_blocks,
-            num_batch_seq,
-            hidden_dim,
-            num_queries,
-            has_grad_lses,
-            accumulate_grad_blocks,
-            stream);
+        launch_with_grad_block(grad_softmax_outputs.data_ptr<float>());
     }
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
