@@ -160,15 +160,6 @@ class BlockAttentionResiduals(torch.autograd.Function):
 
             return grad_layer_input
 
-        grad_pseudo_queries_partial_final = torch.empty(
-            1,
-            B,
-            T,
-            D,
-            device=device,
-            dtype=torch.float32,
-        )
-
         phase_1._batched_attention_backward_accumulate(
             block_representations,
             pseudo_queries[-1:],
@@ -177,14 +168,13 @@ class BlockAttentionResiduals(torch.autograd.Function):
             None,
             grad_block_representations,
             grad_pseudo_queries[-1:],
-            grad_pseudo_queries_partial_final,
+            None,
             eps=eps,
             accumulate_grad_blocks=False,
             inverse_rms_norms=final_inverse_rms_norms,
             attention_logits=final_attention_logits,
         )
 
-        del grad_pseudo_queries_partial_final
         del final_inverse_rms_norms
         del final_attention_logits
 

@@ -110,12 +110,6 @@ def _batched_attention_backward_triton_op(
         dtype=torch.float32,
     )
 
-    grad_pseudo_queries_partial = torch.empty(
-        (num_queries, B, T, D),
-        device=pseudo_queries.device,
-        dtype=torch.float32,
-    )
-
     _batched_attention_backward_accumulate(
         block_representations,
         pseudo_queries,
@@ -124,7 +118,7 @@ def _batched_attention_backward_triton_op(
         grad_lses if has_grad_lses else None,
         grad_block_representations,
         grad_pseudo_queries,
-        grad_pseudo_queries_partial,
+        None,
         eps,
         False,
         inverse_rms_norms,
@@ -158,6 +152,28 @@ def _batched_attention_backward_accumulate(
     if grad_lses is None:
         grad_lses = lses
 
+    if _try_cuda_batched_attention_backward_accumulate(
+        block_representations,
+        pseudo_queries,
+        lses,
+        inverse_rms_norms,
+        attention_logits,
+        grad_softmax_outputs,
+        grad_lses,
+        grad_block_representations,
+        grad_pseudo_queries,
+        has_grad_lses,
+        accumulate_grad_blocks,
+    ):
+        return
+
+    if grad_pseudo_queries_partial is None:
+        grad_pseudo_queries_partial = torch.empty(
+            (num_queries, B, T, D),
+            device=pseudo_queries.device,
+            dtype=torch.float32,
+        )
+
     wrap_triton(phase_1.phase_1_batched_attention_backward_kernel)[(BT,)](
         block_representations,
         pseudo_queries,
@@ -189,6 +205,39 @@ def _batched_attention_backward_accumulate(
         grad_pseudo_queries,
         BT,
         D,
+    )
+
+
+def _try_cuda_batched_attention_backward_accumulate(
+    block_representations,
+    pseudo_queries,
+    lses,
+    inverse_rms_norms,
+    attention_logits,
+    grad_softmax_outputs,
+    grad_lses,
+    grad_block_representations,
+    grad_pseudo_queries,
+    has_grad_lses,
+    accumulate_grad_blocks,
+) -> bool:
+    try:
+        from ..cuda.phase_1_backward import phase_1_backward_accumulate_cuda
+    except ImportError:
+        return False
+
+    return phase_1_backward_accumulate_cuda(
+        block_representations,
+        pseudo_queries,
+        lses,
+        inverse_rms_norms,
+        attention_logits,
+        grad_softmax_outputs,
+        grad_lses,
+        grad_block_representations,
+        grad_pseudo_queries,
+        has_grad_lses,
+        accumulate_grad_blocks,
     )
 
 
